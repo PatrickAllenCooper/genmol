@@ -20,3 +20,14 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+checkpoints/
+*.ckpt
+*.ckpt:Zone.Identifier
+scripts/exps/lead/results/
+scripts/exps/lead/docking/tmp/
+sweep.log
+nohup.out
+.venv/
+miniconda.sh
+oracle/*.pkl
+oracle/*.pkl.gz
