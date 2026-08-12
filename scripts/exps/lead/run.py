@@ -64,9 +64,6 @@ class GenMolOpt():
         print(f'\033[92m{self.fname}\033[0m')
         self.fname = os.path.join(ROOT_DIR, self.fname)
 
-        self.args.lam_rq = 1.0
-        self.args.lam_rs = 1.0
-        self.args.lam_rsim = 1.0
 
         self.Q = defaultdict(float)
         self.N = defaultdict(int)
