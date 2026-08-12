@@ -19,6 +19,7 @@ import sys
 sys.path.append(os.path.realpath('.'))
 
 from time import time
+from collections import defaultdict
 import random
 import argparse
 import pandas as pd
@@ -30,6 +31,7 @@ from genmol.sampler import Sampler
 from genmol.utils.utils_chem import cut
 sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
 import sascorer
+import math
 
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -62,8 +64,30 @@ class GenMolOpt():
         print(f'\033[92m{self.fname}\033[0m')
         self.fname = os.path.join(ROOT_DIR, self.fname)
 
-        if not os.path.exists(os.path.dirname(self.fname)):
-            os.mkdir(os.path.dirname(self.fname))
+        self.args.lam_rq = 1.0
+        self.args.lam_rs = 1.0
+        self.args.lam_rsim = 1.0
+
+        self.Q = defaultdict(float)
+        self.N = defaultdict(int)
+        for prop, frag in self.population:
+            self.Q[frag] = max(self.Q[frag], prop)
+        self.alpha = getattr(self.args, 'q_alpha', 0.4)
+        self.c = self.args.ucb_c
+        self.t = 0  
+
+        tag = self.args.strategy
+        if self.args.strategy == 'bandit':
+            tag += (f'-ucb{self.args.ucb_c}-cap{self.args.pop_cap}'
+                    f'-lamq{self.args.lam_rq}')
+        self.iter_log_path = os.path.join(
+            ROOT_DIR, 'results',
+            f'iterlog_{tag}_{self.args.oracle_name}_'
+            f'id{self.args.start_mol_idx}_{self.args.seed}.csv'
+        )
+        with open(self.iter_log_path, 'w') as f:
+            f.write('iter,strategy,rv_mean,rv_max,n_admitted,n_admitted_mols,'
+                    'fail_rv,fail_rq,fail_rs,fail_rsim,top_ds\n')
     
     def reward_vina(self, smiles_list):
         reward = - np.array(self.predictor.predict(smiles_list))
@@ -94,23 +118,64 @@ class GenMolOpt():
         idx = np.random.randint(len(mols))
         return mols[idx][0]
     
+    def select_frag(self, candidates, exclude=None):
+        if exclude is not None:
+            candidates = [f for f in candidates if f != exclude]
+        if not candidates:
+            return None
+        unpulled = [f for f in candidates if self.N[f] == 0]
+        if unpulled:
+            return random.choice(unpulled)
+        logt = math.log(max(self.t, 2))
+        return max(candidates,
+                   key=lambda f: self.Q[f] + self.c * math.sqrt(logt / self.N[f]))
+    
     def update_population(self, smiles_list, prop_list):
         rv_list, rq_list, rs_list, rsim_list = prop_list
+        fails = {'rv': 0, 'rq': 0, 'rs': 0, 'rsim': 0}
+        n_admitted_mols = 0
+        n_added = 0
         for rv, rq, rs, rsim, smiles in zip(rv_list, rq_list, rs_list, rsim_list, smiles_list):
-            if rv > self.start_prop and rq >= 0.6 and rs >= 6/9 and rsim >= self.args.sim_thr:
+            if not rv > self.start_prop:
+                fails['rv'] += 1
+            elif not rq >= 0.6:
+                fails['rq'] += 1
+            elif not rs >= 6/9:
+                fails['rs'] += 1
+            elif not rsim >= self.args.sim_thr:
+                fails['rsim'] += 1
+            else:
+                n_admitted_mols += 1
                 frags = {frag for frag in cut(smiles)}
+                n_added += len(frags)
                 self.population.extend([(rv, frag) for frag in frags])
         self.population.sort(reverse=True)
+        if self.args.pop_cap > 0:
+            seen, capped = set(), []
+            for prop, frag in self.population:
+                if frag not in seen:
+                    seen.add(frag)
+                    capped.append((prop, frag))
+                if len(capped) >= self.args.pop_cap:
+                    break
+            self.population = capped
+        return fails, n_admitted_mols, n_added
 
     def generate(self):
+        frags = list({frag for _, frag in self.population})
         for _ in range(1000):
-            frag1, frag2 = random.sample([frag for prop, frag in self.population], 2)
+            if self.args.strategy == 'bandit':
+                frag1 = self.select_frag(frags)
+                frag2 = self.select_frag(frags, exclude=frag1)
+            else:
+                frag1, frag2 = random.sample(frags, 2)
             smiles = Chem.MolToSmiles(self.attach(frag1, frag2))
             if smiles is None: continue
             smiles = self.sampler.mask_modification(smiles, min_len=50, gamma=self.args.gamma)
             if smiles is not None:
-                smiles = sorted(smiles.split('.'), key=len)[-1]     # get the largest
-            return smiles
+                smiles = sorted(smiles.split('.'), key=len)[-1]
+            return smiles, (frag1, frag2)
+        return None, (None, None)
             
     def record(self, smiles_list, prop_list):
         with open(self.fname, 'a') as f:
@@ -119,17 +184,55 @@ class GenMolOpt():
                 for props in prop_list: str += f'{props[i]},'
                 str += '\n'
                 f.write(str)
+                
+    def update_bandit(self, frag_pairs, prop_list):
+        rv_list, rq_list, rs_list, rsim_list = prop_list
+        for (frag1, frag2), rv, rq, rs, rsim in zip(
+                frag_pairs, rv_list, rq_list, rs_list, rsim_list):
+            if frag1 is None or frag2 is None:
+                continue
+            shortfall = (self.args.lam_rq * max(0.0, 0.6 - rq) / 0.6
+                         + self.args.lam_rs * max(0.0, 6/9 - rs) / (6/9)
+                         + self.args.lam_rsim * max(0.0, self.args.sim_thr - rsim)
+                           / max(self.args.sim_thr, 1e-6))
+            r = rv - shortfall
+            for frag in (frag1, frag2):
+                self.N[frag] += 1
+                self.t += 1
+                self.Q[frag] += self.alpha * (r - self.Q[frag])
 
     def run(self):
         t_start = time()
         for i in range(self.args.num_iter):
-            smiles_list = [self.generate() for _ in range(self.args.num_gen)]
-            prop_list = self.reward(smiles_list)
-            self.update_population(smiles_list, prop_list)
-            self.record(smiles_list, prop_list)
-            print(f'[Iter {i+1:03d}] Top DS: {self.population[0][0]}')
-        print(f'{time() - t_start:.2f} sec elapsed')
+            gen_results = [self.generate() for _ in range(self.args.num_gen)]
+            smiles_list = [s for s, _ in gen_results]
+            frag_pairs = [p for _, p in gen_results]
 
+            prop_list = self.reward(smiles_list)
+            rv = prop_list[0]
+
+            n_before = len(self.population)
+            if self.args.strategy == 'bandit':
+                self.update_bandit(frag_pairs, prop_list)
+            fails, n_admitted_mols, n_added = self.update_population(smiles_list, prop_list)
+
+            self.record(smiles_list, prop_list)
+
+            arms = {frag for _, frag in self.population}
+            n_unpulled = sum(1 for f in arms if self.N[f] == 0)
+            print(f'  arms={len(arms)} unpulled={n_unpulled} t={self.t}')
+
+            with open(self.iter_log_path, 'a') as f:
+                f.write(f'{i+1},{self.args.strategy},{np.mean(rv):.4f},'
+                        f'{np.max(rv):.4f},{n_added},{n_admitted_mols},'
+                        f"{fails['rv']},{fails['rq']},{fails['rs']},{fails['rsim']},"
+                        f'{self.population[0][0]:.4f}\n')
+
+            print(f'[Iter {i+1:03d}] Top DS: {self.population[0][0]} | '
+                  f'rv mean={np.mean(rv):.2f} max={np.max(rv):.2f} | '
+                  f'admitted={n_added} mols={n_admitted_mols} | '
+                  f"fail rv={fails['rv']} rq={fails['rq']} rs={fails['rs']} rsim={fails['rsim']}")
+        print(f'{time() - t_start:.2f} sec elapsed')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -142,6 +245,12 @@ if __name__ == '__main__':
     parser.add_argument('--num_gen',                type=int,   default=100)
     parser.add_argument('--num_iter',               type=int,   default=10)
     parser.add_argument('--gamma',                  type=float, default=0)
+    parser.add_argument('--lam_rq',   type=float, default=1.0)
+    parser.add_argument('--lam_rs',   type=float, default=1.0)
+    parser.add_argument('--lam_rsim', type=float, default=1.0)
+    parser.add_argument('--strategy', type=str, default='bandit', choices=['random', 'bandit'])
+    parser.add_argument('--ucb_c', type=float, default=2.0)
+    parser.add_argument('--pop_cap', type=int, default=150)
     args = parser.parse_args()
 
     GenMolOpt(args).run()

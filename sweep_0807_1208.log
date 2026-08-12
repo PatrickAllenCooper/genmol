@@ -1,0 +1,4 @@
+nohup: ignoring input
+=== oracle=parp1 strategy=random seed=0 ===
+Failed to find the pandas get_adjustment() function to patch
+Failed to patch pandas - PandasTools will have limited functionality

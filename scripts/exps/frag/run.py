@@ -23,8 +23,8 @@ import yaml
 import pandas as pd
 import numpy as np
 from tdc import Oracle, Evaluator
-from rdkit import DataStructs, Chem, RDLogger
-from rdkit.Chem import AllChem
+from rdkit import Chem, RDLogger
+from rdkit.Chem import DataStructs, AllChem
 from genmol.sampler import Sampler
 RDLogger.DisableLog('rdApp.*')
 
