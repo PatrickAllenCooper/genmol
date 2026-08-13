@@ -126,7 +126,9 @@ PY
 echo ""
 
 echo "--- Verifying ---"
-python -c "import torch; print(f'  torch {torch.__version__}, cuda={torch.cuda.is_available()}')"
+# cuda=False is EXPECTED here: acompile hands out CPU nodes. The worker's
+# preflight checks torch.cuda.is_available() inside the real GPU allocation.
+python -c "import torch; print(f'  torch {torch.__version__}, cuda={torch.cuda.is_available()} (False is expected on an acompile node)')"
 python -c "import rdkit; print(f'  rdkit {rdkit.__version__}')"
 python -c "import transformers; print(f'  transformers {transformers.__version__}')"
 python -c "from openbabel import pybel; print('  openbabel importable')"
@@ -135,8 +137,21 @@ echo ""
 echo "======================================================================="
 echo "Setup complete."
 echo ""
-echo "Still needed: the V1 checkpoint (NGC nvidia/clara/genmol_v1) at"
-echo "  ${PROJ_DIR}/model.ckpt"
+if [ -f "${PROJ_DIR}/model.ckpt" ]; then
+    echo "Checkpoint: ${PROJ_DIR}/model.ckpt ($(stat -c %s "${PROJ_DIR}/model.ckpt") bytes)"
+else
+    echo "STILL NEEDED -- the V1 checkpoint. The NGC CLI is not installed on"
+    echo "Alpine, so use NVIDIA's HuggingFace mirror (public, ungated, one file,"
+    echo "1396949417 bytes). curl needs no conda env and, unlike hf_hub_download,"
+    echo "does not leave a second 1.3 GB copy in the cache:"
+    echo ""
+    echo "  curl -L -o ${PROJ_DIR}/model.ckpt \\"
+    echo "    https://huggingface.co/nvidia/NV-GenMol-89M-v1/resolve/main/model.ckpt"
+fi
+echo ""
+echo "Note: this script activated '${CONDA_ENV_NAME}' in ITS OWN shell only."
+echo "Your prompt is back to (base). Before running anything by hand:"
+echo "  module load anaconda && eval \"\$(conda shell.bash hook)\" && conda activate ${CONDA_ENV_NAME}"
 echo ""
 echo "Then, from a login node:"
 echo "  DRY_RUN=1 bash hpc/queue_grid.sh pilot"
