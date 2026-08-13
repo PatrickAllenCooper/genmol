@@ -32,3 +32,10 @@ miniconda.sh
 oracle/*.pkl
 oracle/*.pkl.gz
 !scripts/exps/lead/EXPERIMENTS.log
+
+# grid search
+logs/
+manifests/
+*.parquet
+runs_*.csv
+finals_*.csv

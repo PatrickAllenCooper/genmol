@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings: a CRLF shebang makes Linux report
+# "bad interpreter: /bin/bash^M", which is exactly what happens when these are
+# authored on Windows and run on Alpine.
+*.sh text eol=lf
+*.slurm text eol=lf

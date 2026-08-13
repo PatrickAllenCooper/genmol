@@ -25,6 +25,7 @@
 # ---------------------------------------------------------------
 
 import os
+import tempfile
 from shutil import rmtree
 from multiprocessing import Manager
 from multiprocessing import Process
@@ -35,9 +36,24 @@ from openbabel import pybel
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
+# Docking failure sentinel. reward_vina() negates and clips this to 0.
+DOCK_FAILED = 99.9
+
+
+def default_scratch_root():
+    """Node-local scratch if SLURM gave us one, else the system temp dir.
+
+    Never the repo checkout: it is shared between concurrent tasks.
+    """
+    for var in ('SLURM_TMPDIR', 'TMPDIR'):
+        path = os.environ.get(var)
+        if path and os.path.isdir(path):
+            return path
+    return tempfile.gettempdir()
+
 
 class DockingVina(object):
-    def __init__(self, target):
+    def __init__(self, target, temp_dir=None, num_sub_proc=None):
         super().__init__()
 
         if target == 'fa7':
@@ -59,21 +75,31 @@ class DockingVina(object):
         self.vina_program = os.path.join(ROOT_DIR, 'docking/qvina02')
         self.receptor_file = os.path.join(ROOT_DIR, f'docking/{target}.pdbqt')
         self.exhaustiveness = 1
-        self.num_sub_proc = 10
-        self.num_cpu_dock = 5
+        # At exhaustiveness=1 qvina runs a single Monte Carlo task, so --cpu
+        # cannot be utilised and each worker is effectively one core. Size the
+        # pool against the allocation rather than the old hardcoded 10.
+        if num_sub_proc is None:
+            num_sub_proc = int(os.environ.get('GENMOL_NUM_SUB_PROC', 0)) or 10
+        self.num_sub_proc = max(1, int(num_sub_proc))
+        self.num_cpu_dock = 1
         self.num_modes = 10
         self.timeout_gen3d = 30
         self.timeout_dock = 100
 
-        i = 0
-        while True:
-            tmp_dir = os.path.join(ROOT_DIR, f'docking/tmp/tmp{i}')
-            if not os.path.exists(tmp_dir):
-                print(f'Docking tmp dir: {tmp_dir}')
-                os.makedirs(tmp_dir)
-                self.temp_dir = tmp_dir
-                break
-            i += 1
+        # The old check-then-create scan over docking/tmp/tmpN was a TOCTOU race
+        # on a path shared by every concurrent task: os.makedirs has no
+        # exist_ok, and the break sits after it, so the losing process raised an
+        # uncaught FileExistsError out of __init__. mkdtemp is atomic and gives
+        # each instance a private directory on node-local scratch.
+        if temp_dir is None:
+            self._owns_temp_dir = True
+            self.temp_dir = tempfile.mkdtemp(prefix='genmol_dock_',
+                                             dir=default_scratch_root())
+        else:
+            self._owns_temp_dir = False
+            os.makedirs(temp_dir, exist_ok=True)
+            self.temp_dir = temp_dir
+        print(f'Docking tmp dir: {self.temp_dir}')
 
     def gen_3d(self, smi, ligand_mol_file):
         """
@@ -168,17 +194,17 @@ class DockingVina(object):
                 self.gen_3d(smi, ligand_mol_file)
             except Exception as e:
                 print(f'gen_3d unexpected error: {smi}')
-                return_dict[idx] = 99.9
+                return_dict[idx] = DOCK_FAILED
                 continue
             try:
                 affinity_list = self.docking(receptor_file, ligand_mol_file,
                                              ligand_pdbqt_file, docking_pdbqt_file)
             except Exception as e:
                 print(f'docking unexpected error: {smi}')
-                return_dict[idx] = 99.9
+                return_dict[idx] = DOCK_FAILED
                 continue
             if len(affinity_list)==0:
-                affinity_list.append(99.9)
+                affinity_list.append(DOCK_FAILED)
             
             affinity = affinity_list[0]
             return_dict[idx] = affinity
@@ -209,14 +235,37 @@ class DockingVina(object):
         proc_master.join()
         for proc in procs:
             proc.join()
-        keys = sorted(return_dict.keys())
-        affinity_list = list()
-        for key in keys:
-            affinity = return_dict[key]
-            affinity_list += [affinity]
+
+        return self.collect_affinities(return_dict, len(smiles_list))
+
+    @staticmethod
+    def collect_affinities(return_dict, n):
+        """Rebuild the affinity list positionally, tolerating missing indices.
+
+        The previous implementation appended over sorted(return_dict.keys()).
+        A worker killed outright (OOM, external signal) never writes its index,
+        and that rebuild then returned a SHORT list in which every score past
+        the gap silently belonged to the previous molecule -- and the zip() in
+        update_population truncated instead of raising. Indexing into a
+        preallocated list keeps SMILES and scores aligned by construction.
+        """
+        affinity_list = [DOCK_FAILED] * n
+        missing = 0
+        for idx in range(n):
+            if idx in return_dict:
+                affinity_list[idx] = return_dict[idx]
+            else:
+                missing += 1
+        if missing:
+            print(f'WARNING: {missing}/{n} docking results missing '
+                  f'(worker died); scored as {DOCK_FAILED}')
         return affinity_list
     
     def __del__(self):
-        if os.path.exists(self.temp_dir):
-            rmtree(self.temp_dir)
-            print(f'{self.temp_dir} removed')
+        # getattr, not self.temp_dir: a failure earlier in __init__ leaves the
+        # attribute unset, and an AttributeError raised during teardown buries
+        # the real traceback.
+        temp_dir = getattr(self, 'temp_dir', None)
+        if getattr(self, '_owns_temp_dir', False) and temp_dir \
+                and os.path.exists(temp_dir):
+            rmtree(temp_dir, ignore_errors=True)
