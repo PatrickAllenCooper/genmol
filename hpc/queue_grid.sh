@@ -61,8 +61,25 @@ MANIFEST="${MANIFEST_DIR}/stage_${STAGE}.jsonl"
 
 # aa100: 3 GPUs / 64 cores per node, quota 6x a100-40gb -> 2 whole-node jobs.
 # ah200: 4 GPUs / 128 cores per node, quota 4x h200      -> 1 whole-node job.
+#
+# These defaults claim the FULL per-user gpu-normal quota for each GRES type.
+# That quota is per USER, not per account, so any other job of yours on the
+# same GRES competes with the grid -- a worker asking for more than what is
+# free sits in QOSGrpGRES indefinitely rather than starting smaller. Check
+# with `squeue -u $USER` first and shrink these to fit:
+#
+#   AH200_GPUS=1 AH200_CPUS=30 bash hpc/queue_grid.sh 1a    # if 3/4 h200 are busy
+#   SKIP_AH200=1 bash hpc/queue_grid.sh 1a                  # aa100 only
+#
+# Keep cpus at roughly 30 per GPU so the pool stays balanced against docking.
 AA100_WORKERS="${AA100_WORKERS:-2}"
 AH200_WORKERS="${AH200_WORKERS:-1}"
+AA100_GPUS="${AA100_GPUS:-3}"
+AH200_GPUS="${AH200_GPUS:-4}"
+AA100_CPUS="${AA100_CPUS:-60}"
+AH200_CPUS="${AH200_CPUS:-120}"
+AA100_MEM="${AA100_MEM:-120G}"
+AH200_MEM="${AH200_MEM:-240G}"
 SKIP_AA100="${SKIP_AA100:-0}"
 SKIP_AH200="${SKIP_AH200:-0}"
 WALLTIME="${WALLTIME:-24:00:00}"
@@ -154,24 +171,24 @@ submit_worker() {
 wid=0
 
 if [ "${SKIP_AA100}" != "1" ]; then
-    echo "--- aa100 (${AA100_WORKERS} workers, 3x a100-40gb each) ---"
+    echo "--- aa100 (${AA100_WORKERS} workers, ${AA100_GPUS}x a100-40gb, ${AA100_CPUS} cpus each) ---"
     for (( i = 0; i < AA100_WORKERS; i++ )); do
         submit_worker "aa100 worker ${wid}" "${wid}" \
-            --partition=aa100 --qos=gpu-normal --gres=gpu:a100-40gb:3 \
-            --cpus-per-task=60 --mem=120G
+            --partition=aa100 --qos=gpu-normal --gres="gpu:a100-40gb:${AA100_GPUS}" \
+            --cpus-per-task="${AA100_CPUS}" --mem="${AA100_MEM}"
         wid=$(( wid + 1 ))
     done
     echo ""
 fi
 
 if [ "${SKIP_AH200}" != "1" ]; then
-    echo "--- ah200 (${AH200_WORKERS} workers, 4x h200 each) ---"
+    echo "--- ah200 (${AH200_WORKERS} workers, ${AH200_GPUS}x h200, ${AH200_CPUS} cpus each) ---"
     for (( i = 0; i < AH200_WORKERS; i++ )); do
         # CLI flags beat the #SBATCH headers, so one worker script covers both
         # partitions with no edits.
         submit_worker "ah200 worker ${wid}" "${wid}" \
-            --partition=ah200 --qos=gpu-normal --gres=gpu:h200:4 \
-            --cpus-per-task=120 --mem=240G
+            --partition=ah200 --qos=gpu-normal --gres="gpu:h200:${AH200_GPUS}" \
+            --cpus-per-task="${AH200_CPUS}" --mem="${AH200_MEM}"
         wid=$(( wid + 1 ))
     done
     echo ""
