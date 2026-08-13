@@ -74,7 +74,11 @@ pip install -r env/requirements.txt
 # --no-deps: pyproject.toml's transformers==4.52.4 pin would otherwise override
 # requirements.txt's 4.56.2 and break safe-mol differently.
 pip install -e . --no-deps
-pip install scikit-learn==1.2.2
+# Deliberately NOT installing scikit-learn==1.2.2. env/setup.sh pins it for the
+# PMO hit-generation oracles (gsk3b, jnk3), which the lead-optimization grid
+# never touches, and the downgrade puts it below bionemo-moco's
+# scikit-learn>=1.6.0 requirement -- and bionemo-moco supplies the MDLM the
+# sampler runs on. Leave the resolved version alone.
 echo ""
 
 echo "--- Patching safe-mol ---"

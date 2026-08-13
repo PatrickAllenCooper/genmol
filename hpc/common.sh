@@ -103,6 +103,16 @@ genmol_preflight() {
         echo "FATAL: rdkit/torch not importable in the active env." >&2
         ok=1
     fi
+    # model.py wraps forward() in torch.amp.autocast('cuda', ...), which merely
+    # warns and no-ops when CUDA is absent. A worker that lost its GPU would
+    # therefore run silently on CPU, several times slower, and blow the
+    # walltime rather than failing. Check explicitly.
+    if ! python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+        echo "FATAL: torch.cuda.is_available() is False inside this allocation." >&2
+        echo "       Check --gres actually granted a GPU (nvidia-smi), and that" >&2
+        echo "       the torch build matches the node's driver." >&2
+        ok=1
+    fi
     [ "$ok" -eq 0 ] && echo "Preflight : OK" && echo ""
     return "$ok"
 }
